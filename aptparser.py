@@ -171,9 +171,9 @@ def get_packages_from_deb_line(deb_line):
             local_file_path = os.path.join("/var/lib/apt/lists", local_file_name)
         except AttributeError as ae:
             console.log("Couldn't match URL!")
-            console.log(f"{URL_MATCHER=}")
-            console.log(f"{packages_file=}")
-            console.log(f"{deb_line=}")
+            #console.log(f"{URL_MATCHER=}")
+            #console.log(f"{packages_file=}")
+            #console.log(f"{deb_line=}")
             raise AttributeError from ae
 
         if os.path.isfile(local_file_path):
@@ -198,97 +198,105 @@ def get_packages_from_deb_line(deb_line):
 
     return release_data
 
+def main():
+    parser = argparse.ArgumentParser(description='Scan, and optionally mirror, an Apt repository')
+    parser.add_argument("sources", metavar="list_file", type=str, nargs="*", help="apt .list files to parse (default: system files)")
+    parser.add_argument("--download", type=str, default="/tmp/apt-download", help="Download all packages from the given repository to this directory")
+    parser.add_argument("--url-file", type=argparse.FileType("w"), help="Save URLs to file")
+    parser.add_argument("--print-table", action="store_true", default=False, help="Print the package data to the console as a table")
+    parser.add_argument("--output-file", type=argparse.FileType("w"), help="Save repository data to a JSON file")
+    parser.add_argument("--input-file", type=argparse.FileType("r"), help="Load repository data from a JSON file")
+    args = parser.parse_args()
 
-parser = argparse.ArgumentParser(description='Scan, and optionally mirror, an Apt repository')
-parser.add_argument("sources", metavar="list_file", type=str, nargs="*", help="apt .list files to parse (default: system files)")
-parser.add_argument("--download", type=str, default="/tmp/apt-download", help="Download all packages from the given repository to this directory")
-parser.add_argument("--url-file", type=argparse.FileType("w"), help="Save URLs to file")
-parser.add_argument("--print-table", action="store_true", default=False, help="Print the package data to the console as a table")
-parser.add_argument("--output-file", type=argparse.FileType("w"), help="Save repository data to a JSON file")
-parser.add_argument("--input-file", type=argparse.FileType("r"), help="Load repository data from a JSON file")
-args = parser.parse_args()
+    packages: typing.Dict[str, SimpleNamespace] = {}
 
-packages: typing.Dict[str, SimpleNamespace] = {}
-
-if args.input_file:
-    packages = json.load(args.input_file)
-else:
-    apt_pkg.init()
-    package_data = []
-    try:
-        if args.sources:
-            deb_lines = get_deb_lines(args.sources)
-        else:
-            deb_lines = get_deb_lines(SOURCES)
-    except InvalidListException:
-        print("Error: the specified file contains no valid debian source lines!")
-        sys.exit(255)
-
-    for deb_line in track(deb_lines, description="Processing deb lines...", console=console):
+    if args.input_file:
+        packages = json.load(args.input_file)
+    else:
+        apt_pkg.init()
+        package_data = []
         try:
-            release_data = get_packages_from_deb_line(deb_line)
-            package_data.extend(release_data)
-        except DebSrcLineUnparseable:
-            print(f"[red]ERR[/] Could not parse line {repr(deb_line)}, skipping")
-        except DebSrcNotImplemented:
-            print(f"Source repository parsing is not implemented, skipping {repr(deb_line)}")
+            if args.sources:
+                deb_lines = get_deb_lines(args.sources)
+            else:
+                deb_lines = get_deb_lines(SOURCES)
+        except InvalidListException:
+            print("Error: the specified file contains no valid debian source lines!")
+            sys.exit(255)
 
-    for package in track(package_data, description="Processing package data...", console=console):
-        if not package:
-            continue
-        pkg = parse_package_metadata(package)
-        package = SimpleNamespace(**pkg)
-        name = package.package
+        for deb_line in track(deb_lines, description="Processing deb lines...", console=console):
+            try:
+                release_data = get_packages_from_deb_line(deb_line)
+                package_data.extend(release_data)
+            except DebSrcLineUnparseable:
+                print(f"[red]ERR[/] Could not parse line {repr(deb_line)}, skipping")
+            except DebSrcNotImplemented:
+                print(f"Source repository parsing is not implemented, skipping {repr(deb_line)}")
 
-        if name in packages.keys():
-            packages[name] = get_larger_version(packages[name], package)
-        else:
-            packages[name] = package
-
-pkg_len = max([len(package.package) for package in packages.values()])
-ver_len = max([len(package.version) for package in packages.values()])
-
-sizes = [package.size for package in packages.values()]
-print("Total size: " + humanfriendly.format_size(sum(sizes), binary=False))
-
-if args.download:
-    print("Starting download")
-
-    for package_name, package in packages.items():
-        with Progress(console=console) as progress:
-            url = f"{package.uri}/{package.filename}"
-            target = f"{args.download}/{package.filename}"
-
-            if os.path.isfile(target) and os.stat(target).st_size == package.size:
-                print(f"Package {package_name} already downloaded, skipping")
-
+        for package in track(package_data, description="Processing package data...", console=console):
+            if not package:
                 continue
+            pkg = parse_package_metadata(package)
+            package = SimpleNamespace(**pkg)
+            name = package.package
 
-            pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
+            if name in packages.keys():
+                packages[name] = get_larger_version(packages[name], package)
+            else:
+                packages[name] = package
 
-            req = requests.get(url, stream=True)
+    pkg_len = max([len(package.package) for package in packages.values()])
+    ver_len = max([len(package.version) for package in packages.values()])
 
-            with open(target, "wb") as output:
-                total_length = int(req.headers.get('content-length'))
-                task = progress.add_task(f"{package_name.ljust(pkg_len)}", total=total_length)
+    sizes = [package.size for package in packages.values()]
+    print("Total size: " + humanfriendly.format_size(sum(sizes), binary=False))
 
-                for chunk in req.iter_content(chunk_size=1024*1024):  # 1 MB
-                    if chunk:
-                        output.write(chunk)
-                        output.flush()
-                        progress.update(task, advance=output.tell())
-if args.print_table:
-    table = Table(title="Available packages")
-    table.add_column("Package name", width=pkg_len+2)
-    table.add_column("Version", width=ver_len+2)
-    table.add_column("Size", width=12)
+    if args.download:
+        print("Starting download")
 
-    for package_name, package in packages.items():
-        table.add_row(package.package, package.version, humanfriendly.format_size(package.size, binary=False))
+        for package_name, package in packages.items():
+            with Progress(console=console) as progress:
+                url = f"{package.uri}/{package.filename}"
+                target = f"{args.download}/{package.filename}"
 
-        if args.url_file:
-            args.url_file.write(f"{package_name:{pkg_len}} {package.uri}/{package.filename}\n")
-    console.print(table)
+                if os.path.isfile(target) and os.stat(target).st_size == package.size:
+                    print(f"Package {package_name} already downloaded, skipping")
 
-if args.output_file:
-    json.dump(packages, args.output_file, cls=NamespaceEncoder)
+                    continue
+
+                pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
+
+                req = requests.get(url, stream=True)
+
+                with open(target, "wb") as output:
+                    total_length = int(req.headers.get('content-length'))
+                    task = progress.add_task(f"{package_name.ljust(pkg_len)}", total=total_length)
+
+                    for chunk in req.iter_content(chunk_size=1024*1024):  # 1 MB
+                        if chunk:
+                            output.write(chunk)
+                            output.flush()
+                            progress.update(task, advance=output.tell())
+    if args.print_table:
+        table = Table(title="Available packages")
+        table.add_column("Package name", width=pkg_len+2)
+        table.add_column("Version", width=ver_len+2)
+        table.add_column("Size", width=12)
+
+        for package_name, package in packages.items():
+            table.add_row(package.package, package.version, humanfriendly.format_size(package.size, binary=False))
+
+            if args.url_file:
+                args.url_file.write(f"{package_name:{pkg_len}} {package.uri}/{package.filename}\n")
+        console.print(table)
+
+    if args.output_file:
+        json.dump(packages, args.output_file, cls=NamespaceEncoder)
+
+
+if __name__ == "__main__":
+    from pyannotate_runtime import collect_types
+    collect_types.init_types_collection()
+    with collect_types.collect():
+        main()
+    collect_types.dump_stats('type_info.json')
