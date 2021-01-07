@@ -17,6 +17,10 @@ import requests
 from rich.console import Console
 from rich.progress import Progress, track
 from rich.table import Table
+from typing import Iterator
+from typing import List
+from typing import Dict
+from typing import Any
 
 console = Console()
 print = console.print
@@ -55,11 +59,11 @@ class InvalidListException(Exception):
     pass
 
 
-def flatten(outer):
+def flatten(outer: List[List[Any]]) -> Iterator:
     for inner in outer:
         yield from inner
 
-def parse_package_metadata(package):
+def parse_package_metadata(package: str) -> Dict[str, str]:
     pkg = {}
     lines = package.strip("\n").split("\n")
 
@@ -89,7 +93,7 @@ def parse_package_metadata(package):
         pkg[k.lower()] = v
     return pkg
 
-def get_larger_version(pkg1, pkg2):
+def get_larger_version(pkg1: SimpleNamespace, pkg2: SimpleNamespace) -> SimpleNamespace:
     # Ignore deprecation warning from apt_pkg.version_compare
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -111,7 +115,7 @@ def filter_deb_line(line):
         raise DebSrcLineUnparseable()
 
 
-def get_deb_lines(package_sources):
+def get_deb_lines(package_sources: List[str]) -> List[str]:
     package_files: list[str] = []
     for source in package_sources:
         if os.path.isfile(source):
@@ -141,7 +145,37 @@ def get_deb_lines(package_sources):
 
     raise InvalidListException()
 
-def get_packages_from_deb_line(deb_line):
+def get_files_from_deb_line(deb_line: str) -> List[str]:
+    deb_line = re.sub(" ?#.*", "", deb_line)
+    res = SOURCES_LINE_PAT.match(deb_line)
+
+    if res is None:
+        raise DebSrcLineUnparseable(f"Could not parse deb line {repr(deb_line)}")
+
+    results = res.groupdict()
+
+    if results['source_type'] == "deb-src":
+        raise DebSrcNotImplemented()
+
+    source_url = results['url']
+    source_release = results['release']
+    source_components = re.split(r"\s+", results['components'])
+
+    release_data = []
+
+    inrelease_file = os.path.join(source_url,
+                                    "dists",
+                                    source_release,
+                                    "InRelease"
+                                    )
+
+    req = requests.get(inrelease_file)
+    if req.status_code != 200:
+        raise ValueError(f"Could not fetch InRelease file: error {req.status_code}")
+    data = req.content.decode()
+
+
+def get_packages_from_deb_line(deb_line: str) -> List[str]:
     deb_line = re.sub(" ?#.*", "", deb_line)
     res = SOURCES_LINE_PAT.match(deb_line)
 
@@ -171,9 +205,6 @@ def get_packages_from_deb_line(deb_line):
             local_file_path = os.path.join("/var/lib/apt/lists", local_file_name)
         except AttributeError as ae:
             console.log("Couldn't match URL!")
-            #console.log(f"{URL_MATCHER=}")
-            #console.log(f"{packages_file=}")
-            #console.log(f"{deb_line=}")
             raise AttributeError from ae
 
         if os.path.isfile(local_file_path):
@@ -198,10 +229,10 @@ def get_packages_from_deb_line(deb_line):
 
     return release_data
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description='Scan, and optionally mirror, an Apt repository')
     parser.add_argument("sources", metavar="list_file", type=str, nargs="*", help="apt .list files to parse (default: system files)")
-    parser.add_argument("--download", type=str, default="/tmp/apt-download", help="Download all packages from the given repository to this directory")
+    parser.add_argument("--download", type=str, help="Download all packages from the given repository to this directory")
     parser.add_argument("--url-file", type=argparse.FileType("w"), help="Save URLs to file")
     parser.add_argument("--print-table", action="store_true", default=False, help="Print the package data to the console as a table")
     parser.add_argument("--output-file", type=argparse.FileType("w"), help="Save repository data to a JSON file")
@@ -253,9 +284,10 @@ def main():
 
     if args.download:
         print("Starting download")
-
-        for package_name, package in packages.items():
-            with Progress(console=console) as progress:
+        with Progress(console=console) as progress:
+            packages_task = progress.add_task("Package downloads", total=len(packages))
+            for package_name in sorted(packages.keys()):
+                package = packages[package_name]
                 url = f"{package.uri}/{package.filename}"
                 target = f"{args.download}/{package.filename}"
 
@@ -277,6 +309,8 @@ def main():
                             output.write(chunk)
                             output.flush()
                             progress.update(task, advance=output.tell())
+                    output.flush()
+
     if args.print_table:
         table = Table(title="Available packages")
         table.add_column("Package name", width=pkg_len+2)
@@ -295,8 +329,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from pyannotate_runtime import collect_types
-    collect_types.init_types_collection()
-    with collect_types.collect():
-        main()
-    collect_types.dump_stats('type_info.json')
+    main()
