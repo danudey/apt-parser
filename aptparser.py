@@ -11,16 +11,27 @@ import typing
 import warnings
 from types import SimpleNamespace
 
-import apt_pkg
-import humanfriendly
-import requests
-from rich.console import Console
-from rich.progress import Progress, track
-from rich.table import Table
 from typing import Iterator
 from typing import List
 from typing import Dict
 from typing import Any
+
+import apt_pkg
+import humanfriendly
+import requests
+
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    TextColumn,
+    TransferSpeedColumn,
+    TimeRemainingColumn,
+    Progress,
+    TaskID,
+    track
+)
+from rich.table import Table
 
 console = Console()
 print = console.print
@@ -229,6 +240,22 @@ def get_packages_from_deb_line(deb_line: str) -> List[str]:
 
     return release_data
 
+def copy_url(task_id: TaskID, url: str, path: str) -> None:
+    """Copy data from a url to a local file."""
+    req = requests.get(url, stream=True)
+
+    with open(path, "wb") as output:
+        total_length = int(req.headers.get('content-length'))
+        progress.update(task_id, total=total_length)
+
+        for chunk in req.iter_content(chunk_size=1024*1024):  # 1 MB
+            if chunk:
+                output.write(chunk)
+                output.flush()
+                progress.update(task, advance=len(chunk))
+        output.flush()
+        progress.remove_task(task_id)
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Scan, and optionally mirror, an Apt repository')
     parser.add_argument("sources", metavar="list_file", type=str, nargs="*", help="apt .list files to parse (default: system files)")
@@ -281,10 +308,21 @@ def main() -> None:
 
     sizes = [package.size for package in packages.values()]
     print("Total size: " + humanfriendly.format_size(sum(sizes), binary=False))
-
+    progress = Progress(
+        # TextColumn("[bold blue]{task.fields[packagename]}", justify="right"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        "[progress.percentage]{task.percentage:>3.1f}%",
+        "•",
+        DownloadColumn(),
+        "•",
+        TransferSpeedColumn(),
+        "•",
+        TimeRemainingColumn(),
+    )
     if args.download:
         print("Starting download")
-        with Progress(console=console) as progress:
+        with progress:
             packages_task = progress.add_task("Package downloads", total=len(packages))
             for package_name in sorted(packages.keys()):
                 package = packages[package_name]
@@ -308,8 +346,10 @@ def main() -> None:
                         if chunk:
                             output.write(chunk)
                             output.flush()
-                            progress.update(task, advance=output.tell())
+                            progress.update(task, advance=len(chunk))
                     output.flush()
+                    progress.remove_task(task)
+                progress.advance(packages_task)
 
     if args.print_table:
         table = Table(title="Available packages")
