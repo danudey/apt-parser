@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 
-import argparse
-import gzip
-import json
 import os
-import pathlib
 import re
 import sys
+import gzip
+import json
 import typing
+import pathlib
+import argparse
 import warnings
+
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 
 from typing import Iterator
 from typing import List
 from typing import Dict
 from typing import Any
 
-import apt_pkg
 import humanfriendly
 import requests
+import apt_pkg
 
 from rich.console import Console
+from rich.table import Table
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -31,7 +34,6 @@ from rich.progress import (
     TaskID,
     track
 )
-from rich.table import Table
 
 console = Console()
 print = console.print
@@ -269,7 +271,10 @@ def main() -> None:
     packages: typing.Dict[str, SimpleNamespace] = {}
 
     if args.input_file:
-        packages = json.load(args.input_file)
+        packages_tmp = json.load(args.input_file)
+        packages = {}
+        for package_name, package in packages_tmp.items():
+            packages[package_name] = SimpleNamespace(**package)
     else:
         apt_pkg.init()
         package_data = []
@@ -302,6 +307,7 @@ def main() -> None:
                 packages[name] = get_larger_version(packages[name], package)
             else:
                 packages[name] = package
+
 
     pkg_len = max([len(package.package) for package in packages.values()])
     ver_len = max([len(package.version) for package in packages.values()])
