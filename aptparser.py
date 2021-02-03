@@ -11,6 +11,7 @@ import argparse
 import warnings
 
 from types import SimpleNamespace
+from functools import reduce
 from concurrent.futures import ThreadPoolExecutor
 
 from typing import Iterator
@@ -182,7 +183,7 @@ def get_files_from_deb_line(deb_line: str) -> List[str]:
                                     "InRelease"
                                     )
 
-    req = requests.get(inrelease_file)
+    req = requests.get(inrelease_file, timeout=5)
     if req.status_code != 200:
         raise ValueError(f"Could not fetch InRelease file: error {req.status_code}")
     data = req.content.decode()
@@ -224,7 +225,7 @@ def get_packages_from_deb_line(deb_line: str) -> List[str]:
             data = open(local_file_path).read()
             status = "[cyan]Cache[/]"
         else:
-            req = requests.get(packages_file)
+            req = requests.get(packages_file, timeout=5)
 
             if req.status_code == 200:
                 data = gzip.decompress(req.content).decode()
@@ -244,7 +245,7 @@ def get_packages_from_deb_line(deb_line: str) -> List[str]:
 
 def copy_url(task_id: TaskID, url: str, path: str) -> None:
     """Copy data from a url to a local file."""
-    req = requests.get(url, stream=True)
+    req = requests.get(url, stream=True, timeout=5)
 
     with open(path, "wb") as output:
         total_length = int(req.headers.get('content-length'))
@@ -262,6 +263,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Scan, and optionally mirror, an Apt repository')
     parser.add_argument("sources", metavar="list_file", type=str, nargs="*", help="apt .list files to parse (default: system files)")
     parser.add_argument("--download", type=str, help="Download all packages from the given repository to this directory")
+    parser.add_argument("--single-version", action="store_true", help="Only download/list/index the latest version of a package")
     parser.add_argument("--url-file", type=argparse.FileType("w"), help="Save URLs to file")
     parser.add_argument("--print-table", action="store_true", default=False, help="Print the package data to the console as a table")
     parser.add_argument("--output-file", type=argparse.FileType("w"), help="Save repository data to a JSON file")
@@ -269,6 +271,8 @@ def main() -> None:
     args = parser.parse_args()
 
     packages: typing.Dict[str, SimpleNamespace] = {}
+
+    all_packages: List[SimpleNamespace] = []
 
     if args.input_file:
         packages_tmp = json.load(args.input_file)
@@ -303,16 +307,27 @@ def main() -> None:
             package = SimpleNamespace(**pkg)
             name = package.package
 
+            all_packages.append(package)
+
             if name in packages.keys():
-                packages[name] = get_larger_version(packages[name], package)
+                packages[name].append(package)
             else:
-                packages[name] = package
+                packages[name] = [package]
 
 
-    pkg_len = max([len(package.package) for package in packages.values()])
-    ver_len = max([len(package.version) for package in packages.values()])
 
-    sizes = [package.size for package in packages.values()]
+
+    pkg_len = max([len(package.package) for package in all_packages])
+    ver_len = max([len(package.version) for package in all_packages])
+
+    if args.single_version:
+        sizes = [package[0].size for package in packages.values()]
+    else:
+        sizes = [package.size for package in all_packages]
+
+    if args.single_version:
+        packages = {package_name: [reduce(get_larger_version, package_versions)] for (package_name, package_versions) in packages.items()}
+
     print("Total size: " + humanfriendly.format_size(sum(sizes), binary=False))
     progress = Progress(
         # TextColumn("[bold blue]{task.fields[packagename]}", justify="right"),
@@ -331,43 +346,49 @@ def main() -> None:
         with progress:
             packages_task = progress.add_task("Package downloads", total=len(packages))
             for package_name in sorted(packages.keys()):
-                package = packages[package_name]
-                url = f"{package.uri}/{package.filename}"
-                target = f"{args.download}/{package.filename}"
+                for package in packages[package_name]:
+                    url = f"{package.uri}/{package.filename}"
+                    target = f"{args.download}/{package.filename}"
 
-                if os.path.isfile(target) and os.stat(target).st_size == package.size:
-                    print(f"Package {package_name} already downloaded, skipping")
+                    if os.path.isfile(target) and os.stat(target).st_size == package.size:
+                        print(f"Package {package_name} already downloaded, skipping")
 
-                    continue
+                        continue
 
-                pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
+                    pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
 
-                req = requests.get(url, stream=True)
+                    req = requests.get(url, stream=True, timeout=5)
 
-                with open(target, "wb") as output:
-                    total_length = int(req.headers.get('content-length'))
-                    task = progress.add_task(f"{package_name.ljust(pkg_len)}", total=total_length)
+                    with open(target, "wb") as output:
+                        total_length = int(req.headers.get('content-length'))
+                        task = progress.add_task(f"{package_name.ljust(pkg_len)}", total=total_length)
 
-                    for chunk in req.iter_content(chunk_size=1024*1024):  # 1 MB
-                        if chunk:
-                            output.write(chunk)
-                            output.flush()
-                            progress.update(task, advance=len(chunk))
-                    output.flush()
-                    progress.remove_task(task)
-                progress.advance(packages_task)
+                        for chunk in req.iter_content(chunk_size=1024*1024):  # 1 MB
+                            if chunk:
+                                output.write(chunk)
+                                output.flush()
+                                progress.update(task, advance=len(chunk))
+                        output.flush()
+                        progress.remove_task(task)
+                    progress.advance(packages_task)
+
+
+    if args.print_table or args.url_file:
+        if args.print_table:
+            table = Table(title="Available packages")
+            table.add_column("Package name", width=pkg_len+2)
+            table.add_column("Version", width=ver_len+2)
+            table.add_column("Size", width=12)
+
+        for package_name, package_versions in packages.items():
+            for package in package_versions:
+                if args.print_table:
+                    table.add_row(package.package, package.version, humanfriendly.format_size(package.size, binary=False))
+
+                if args.url_file:
+                    args.url_file.write(f"{package_name:{pkg_len}} {package.uri}/{package.filename}\n")
 
     if args.print_table:
-        table = Table(title="Available packages")
-        table.add_column("Package name", width=pkg_len+2)
-        table.add_column("Version", width=ver_len+2)
-        table.add_column("Size", width=12)
-
-        for package_name, package in packages.items():
-            table.add_row(package.package, package.version, humanfriendly.format_size(package.size, binary=False))
-
-            if args.url_file:
-                args.url_file.write(f"{package_name:{pkg_len}} {package.uri}/{package.filename}\n")
         console.print(table)
 
     if args.output_file:
